@@ -131,6 +131,11 @@ func (c *Coordinator) SubmitBatch(cmds []domain.Command) ([]domain.Event, error)
 
 // execute runs the commands as one transaction.
 func (c *Coordinator) execute(cmds []domain.Command) ([]domain.Event, error) {
+	if len(cmds) == 0 {
+		return nil, scerr.New(scerr.CodeBatchPartialInvalid,
+			"batch rejected: no records").WithRetryable(false)
+	}
+
 	// group commands by family preserving first-seen order for lock acquisition
 	famOrder := []string{}
 	famCmds := map[string][]int{}

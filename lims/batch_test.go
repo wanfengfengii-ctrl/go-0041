@@ -146,6 +146,73 @@ func TestUnknownKeyID(t *testing.T) {
 	}
 }
 
+// TestEmptyBatchRejectedWithoutSideEffects verifies that every batch entry
+// point rejects an empty batch without changing durable or published state.
+func TestEmptyBatchRejectedWithoutSideEffects(t *testing.T) {
+	a, s := newAdapter(t)
+	testutil.Register(s, t, "fam-existing", "m1", "donor", "lab", 100)
+
+	records := make([]lims.Record, 0)
+	sig, err := lims.Sign(secret, records)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	jsonBatch, err := lims.EncodeJSON(records, keyID, sig)
+	if err != nil {
+		t.Fatalf("encode JSON: %v", err)
+	}
+	csvBatch, err := lims.EncodeCSV(records, keyID, sig)
+	if err != nil {
+		t.Fatalf("encode CSV: %v", err)
+	}
+
+	seqBefore := s.Coord.AppliedSeq()
+	committedBefore := s.Store.CommittedAt()
+	digestBefore, err := s.Coord.DigestAll()
+	if err != nil {
+		t.Fatalf("digest before: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		run  func() ([]domain.Event, error)
+	}{
+		{name: "JSON", run: func() ([]domain.Event, error) { return a.Import("json", jsonBatch) }},
+		{name: "CSV", run: func() ([]domain.Event, error) { return a.Import("csv", csvBatch) }},
+		{name: "SubmitBatch", run: func() ([]domain.Event, error) { return s.Coord.SubmitBatch(nil) }},
+	}
+
+	var rejectionMessage string
+	for _, tc := range cases {
+		events, err := tc.run()
+		if len(events) != 0 {
+			t.Fatalf("%s returned %d events", tc.name, len(events))
+		}
+		se := scerr.As(err)
+		if se == nil || se.Code != scerr.CodeBatchPartialInvalid {
+			t.Fatalf("%s: expected structured BATCH_PARTIAL_INVALID, got %v", tc.name, err)
+		}
+		if rejectionMessage == "" {
+			rejectionMessage = se.Message
+		} else if se.Message != rejectionMessage {
+			t.Fatalf("%s: rejection message %q differs from %q", tc.name, se.Message, rejectionMessage)
+		}
+		if got := s.Store.CommittedAt(); got != committedBefore {
+			t.Fatalf("%s changed event log length: %d != %d", tc.name, got, committedBefore)
+		}
+		if got := s.Coord.AppliedSeq(); got != seqBefore {
+			t.Fatalf("%s changed applied sequence: %d != %d", tc.name, got, seqBefore)
+		}
+		digestAfter, err := s.Coord.DigestAll()
+		if err != nil {
+			t.Fatalf("%s digest after: %v", tc.name, err)
+		}
+		if digestAfter != digestBefore {
+			t.Fatalf("%s changed published family state: %s != %s", tc.name, digestAfter, digestBefore)
+		}
+	}
+}
+
 // TestBatchPartialInvalid verifies a batch with valid and multiple invalid
 // records is wholly rejected with BATCH_PARTIAL_INVALID and a sorted per-record
 // problem list, and that nothing is written.
