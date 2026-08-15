@@ -308,6 +308,9 @@ func Authorize(cmd Command) error {
 	if !cmd.Principal.Role.IsWrite() {
 		return errPermission("auditors may not write", cmd.Op, cmd.EntityID)
 	}
+	if cmd.Principal.Department == "" {
+		return errPermission("department is required", cmd.Op, cmd.EntityID).WithField("department")
+	}
 	switch cmd.Op {
 	case OpSeal, OpDestroy:
 		if cmd.Principal.Role != RoleApprover {

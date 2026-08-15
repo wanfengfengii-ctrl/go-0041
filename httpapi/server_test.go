@@ -182,5 +182,150 @@ func TestEventsAuditEndpoint(t *testing.T) {
 	}
 }
 
+func TestEmptyDepartmentCannotTakeCustodyOrDispose(t *testing.T) {
+	newHandler := func(t *testing.T) (*httpapi.Server, *testutil.System) {
+		t.Helper()
+		s := testutil.NewSystem(t)
+		keys := infra.NewMapKeyStore(map[string][]byte{"k1": []byte("secret")})
+		return httpapi.New(s.Coord, s.Store, lims.NewAdapter(s.Coord, keys), s.IDGen), s
+	}
+	postHandler := func(t *testing.T, srv *httpapi.Server, path string, body any) *http.Response {
+		t.Helper()
+		payload, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		srv.ServeHTTP(recorder, req)
+		return recorder.Result()
+	}
+	returnMother := func(t *testing.T, s *testutil.System, familyID, entityID string) {
+		t.Helper()
+		testutil.Register(s, t, familyID, entityID, "donor", "lab", 100)
+		if _, err := s.Coord.Submit(domain.Command{
+			Op: domain.OpReturn, Principal: testutil.Op("lab"),
+			FamilyID: familyID, EntityID: entityID,
+		}); err != nil {
+			t.Fatalf("return %s: %v", entityID, err)
+		}
+	}
+	assertUnchanged := func(t *testing.T, s *testutil.System, familyID, entityID string, revision, seq uint64, committed int64) {
+		t.Helper()
+		fam := s.Coord.Family(familyID)
+		if fam.Revision != revision || s.Coord.AppliedSeq() != seq || s.Store.CommittedAt() != committed {
+			t.Fatalf("denied command changed revision, sequence, or log offset: rev=%d seq=%d offset=%d", fam.Revision, s.Coord.AppliedSeq(), s.Store.CommittedAt())
+		}
+		if fam.Mother.ID != entityID || fam.Mother.CustodyDept != "" || fam.Mother.Status != domain.StatusActive {
+			t.Fatalf("denied command changed entity: %+v", fam.Mother)
+		}
+		if len(fam.Seals) != 0 || len(fam.Destructions) != 0 {
+			t.Fatalf("denied command created audit records: seals=%d destructions=%d", len(fam.Seals), len(fam.Destructions))
+		}
+	}
+	assertPermission := func(t *testing.T, err error, op string) {
+		t.Helper()
+		se := scerr.As(err)
+		if se == nil || se.Code != scerr.CodePermissionDenied || se.Field != "department" || se.Operation != op {
+			t.Fatalf("expected structured department permission error for %s, got %v", op, err)
+		}
+	}
+
+	t.Run("coordinator claim", func(t *testing.T) {
+		s := testutil.NewSystem(t)
+		returnMother(t, s, "fam-claim", "m-claim")
+		revision, seq, committed := s.Coord.Family("fam-claim").Revision, s.Coord.AppliedSeq(), s.Store.CommittedAt()
+		_, err := s.Coord.Submit(domain.Command{
+			Op: domain.OpClaim, Principal: domain.Principal{Operator: "empty", Role: domain.RoleOperator},
+			FamilyID: "fam-claim", EntityID: "m-claim",
+		})
+		assertPermission(t, err, domain.OpClaim)
+		assertUnchanged(t, s, "fam-claim", "m-claim", revision, seq, committed)
+	})
+
+	t.Run("HTTP seal and destroy", func(t *testing.T) {
+		srv, s := newHandler(t)
+		returnMother(t, s, "fam-http", "m-http")
+		revision, seq, committed := s.Coord.Family("fam-http").Revision, s.Coord.AppliedSeq(), s.Store.CommittedAt()
+		for _, cmd := range []domain.Command{
+			{Op: domain.OpSeal, FamilyID: "fam-http", EntityID: "m-http", SealID: "seal-empty", Principal: domain.Principal{Operator: "empty", Role: domain.RoleApprover}},
+			{Op: domain.OpDestroy, FamilyID: "fam-http", EntityID: "m-http", DestructionID: "destroy-empty", Principal: domain.Principal{Operator: "empty", Role: domain.RoleApprover}},
+		} {
+			resp := postHandler(t, srv, "/commands", cmd)
+			var se scerr.Error
+			if err := json.NewDecoder(resp.Body).Decode(&se); err != nil {
+				t.Fatalf("decode %s error: %v", cmd.Op, err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("%s status = %d, want %d", cmd.Op, resp.StatusCode, http.StatusForbidden)
+			}
+			assertPermission(t, &se, cmd.Op)
+			assertUnchanged(t, s, "fam-http", "m-http", revision, seq, committed)
+		}
+	})
+
+	t.Run("signed LIMS batch is atomic", func(t *testing.T) {
+		s := testutil.NewSystem(t)
+		returnMother(t, s, "fam-valid", "m-valid")
+		returnMother(t, s, "fam-empty", "m-empty")
+		adapter := lims.NewAdapter(s.Coord, infra.NewMapKeyStore(map[string][]byte{"k1": []byte("secret")}))
+		records := []lims.Record{
+			{Op: domain.OpClaim, FamilyID: "fam-valid", EntityID: "m-valid", Operator: "valid", Department: "new-lab", Role: "operator"},
+			{Op: domain.OpDestroy, FamilyID: "fam-empty", EntityID: "m-empty", DestructionID: "destroy-empty", Operator: "empty", Role: "approver"},
+		}
+		sig, err := lims.Sign([]byte("secret"), records)
+		if err != nil {
+			t.Fatalf("sign batch: %v", err)
+		}
+		body, err := lims.EncodeJSON(records, "k1", sig)
+		if err != nil {
+			t.Fatalf("encode batch: %v", err)
+		}
+		seq, committed := s.Coord.AppliedSeq(), s.Store.CommittedAt()
+		_, err = adapter.Import("json", body)
+		se := scerr.As(err)
+		if se == nil || se.Code != scerr.CodeBatchPartialInvalid || len(se.Details) != 1 || se.Details[0].RecordIndex != 1 || se.Details[0].Code != scerr.CodePermissionDenied {
+			t.Fatalf("expected record 1 permission rejection, got %v", err)
+		}
+		assertUnchanged(t, s, "fam-valid", "m-valid", 2, seq, committed)
+		assertUnchanged(t, s, "fam-empty", "m-empty", 2, seq, committed)
+	})
+
+	t.Run("non-empty custodian remains authorized", func(t *testing.T) {
+		srv, s := newHandler(t)
+		returnMother(t, s, "fam-authorized", "m-authorized")
+		if _, err := s.Coord.Submit(domain.Command{
+			Op: domain.OpClaim, Principal: testutil.Op("new-lab"),
+			FamilyID: "fam-authorized", EntityID: "m-authorized",
+		}); err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		resp := postHandler(t, srv, "/commands", domain.Command{
+			Op: domain.OpSeal, Principal: testutil.Approver("new-lab"),
+			FamilyID: "fam-authorized", EntityID: "m-authorized", SealID: "seal-valid",
+		})
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("seal status = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+		adapter := lims.NewAdapter(s.Coord, infra.NewMapKeyStore(map[string][]byte{"k1": []byte("secret")}))
+		records := []lims.Record{{
+			Op: domain.OpDestroy, FamilyID: "fam-authorized", EntityID: "m-authorized", DestructionID: "destroy-valid",
+			Operator: "approver", Department: "new-lab", Role: "approver",
+		}}
+		sig, _ := lims.Sign([]byte("secret"), records)
+		body, _ := lims.EncodeJSON(records, "k1", sig)
+		if _, err := adapter.Import("json", body); err != nil {
+			t.Fatalf("destroy batch: %v", err)
+		}
+		fam := s.Coord.Family("fam-authorized")
+		if fam.Revision != 5 || fam.Mother.Status != domain.StatusDestroyed || len(fam.Seals) != 1 || len(fam.Destructions) != 1 {
+			t.Fatalf("unexpected authorized final state: %+v", fam)
+		}
+	})
+}
+
 // silence unused import warnings for strings if not otherwise used
 var _ = strings.TrimSpace
