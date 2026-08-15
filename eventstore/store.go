@@ -46,9 +46,11 @@ func Open(path string, syncer infra.Syncer) (*Store, error) {
 }
 
 // scan reads existing frames to recover the chain state. It stops at the first
-// truncated or corrupt frame and reports it as a structured error carrying the
-// last valid sequence number, rather than silently dropping data. A clean EOF
-// at a frame boundary is not an error.
+// truncated or corrupt frame — including a non-contiguous sequence number
+// (duplicate, backward or jump), which is treated as header tampering — and
+// reports it as a structured error carrying the last valid sequence number,
+// rather than silently dropping data. A clean EOF at a frame boundary is not an
+// error.
 func (s *Store) scan() error {
 	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
 		return scerr.New(scerr.CodeStorage, fmt.Sprintf("seek: %v", err)).WithRetryable(true)
@@ -57,7 +59,7 @@ func (s *Store) scan() error {
 	var lastGood uint64
 	off := int64(0)
 	for {
-		ev, digest, err := decodeFrame(s.f, off, prevDigest)
+		ev, digest, err := decodeFrame(s.f, off, prevDigest, lastGood+1)
 		if err == io.EOF {
 			break
 		}
@@ -144,8 +146,9 @@ func (s *Store) Append(events []domain.Event) ([]domain.Event, error) {
 }
 
 // Replay reads the entire log from the beginning, invoking fn for each event
-// in sequence order. It stops at the first truncated or corrupt frame and
-// returns the structured error carrying the last valid sequence number.
+// in sequence order. It stops at the first truncated or corrupt frame —
+// including a non-contiguous sequence number (duplicate, backward or jump) —
+// and returns the structured error carrying the last valid sequence number.
 func (s *Store) Replay(fn func(domain.Event) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -156,7 +159,7 @@ func (s *Store) Replay(fn func(domain.Event) error) error {
 	var lastGood uint64
 	off := int64(0)
 	for {
-		ev, digest, err := decodeFrame(s.f, off, prevDigest)
+		ev, digest, err := decodeFrame(s.f, off, prevDigest, lastGood+1)
 		if err == io.EOF {
 			return nil
 		}

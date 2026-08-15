@@ -1,6 +1,7 @@
 package eventstore
 
 import (
+	"encoding/binary"
 	"io"
 	"os"
 	"testing"
@@ -145,6 +146,22 @@ func frameOffsets(t *testing.T, path string) []int64 {
 	return offs
 }
 
+// setSeqAt overwrites the sequence number (big-endian uint64 at header bytes
+// 4:12) of the frame starting at off, without recomputing any digest or CRC.
+// This simulates header tampering that the checksum chain alone cannot detect
+// on the last frame.
+func setSeqAt(t *testing.T, path string, off int64, seq uint64) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	binary.BigEndian.PutUint64(data[off+4:off+12], seq)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
 // TestLogTruncatedInBody truncates the log partway through a frame body and
 // expects Replay to return LOG_TRUNCATED with the last valid sequence.
 func TestLogTruncatedInBody(t *testing.T) {
@@ -226,6 +243,149 @@ func TestLogCorruptByteFlip(t *testing.T) {
 	}
 	if se.LastSeq != 1 {
 		t.Fatalf("last valid seq = %d, want 1", se.LastSeq)
+	}
+}
+
+// TestOpenRejectsNonContiguousSeq verifies that reopening a log whose last
+// frame carries a duplicate, backward or jumped sequence number fails with
+// LOG_CORRUPT and reports the last valid sequence, rather than silently
+// accepting the tampered seq and continuing appends from it. The last frame is
+// corrupted without recomputing any digest or CRC, which the checksum chain
+// alone cannot detect.
+func TestOpenRejectsNonContiguousSeq(t *testing.T) {
+	cases := []struct {
+		name string
+		seq  uint64 // seq written into frame 3's header
+	}{
+		{"duplicate", 2}, // == frame 2's seq
+		{"backward", 1},  // < frame 2's seq
+		{"jump", 5},      // > frame 2's seq + 1
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := dir + "/events.log"
+			s, err := Open(path, infra.RealSyncer{})
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if _, err := s.Append(sampleEvents()); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			offs := frameOffsets(t, path)
+			// tamper with the last frame's seq without touching any checksum
+			setSeqAt(t, path, offs[len(offs)-1], tc.seq)
+			if err := s.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			_, err = Open(path, infra.RealSyncer{})
+			if err == nil {
+				t.Fatal("expected open to reject non-contiguous seq")
+			}
+			se := scerr.As(err)
+			if se == nil || se.Code != scerr.CodeLogCorrupt {
+				t.Fatalf("expected LOG_CORRUPT, got %v", err)
+			}
+			if se.LastSeq != 2 {
+				t.Fatalf("last seq = %d, want 2 (last valid)", se.LastSeq)
+			}
+		})
+	}
+}
+
+// TestReplayRejectsNonContiguousSeq verifies that full replay treats a
+// non-contiguous sequence as log corruption and stops, retaining the last
+// valid sequence, instead of replaying the tampered frame.
+func TestReplayRejectsNonContiguousSeq(t *testing.T) {
+	s := openStore(t, infra.RealSyncer{})
+	if _, err := s.Append(sampleEvents()); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	offs := frameOffsets(t, s.Path())
+	// jump the last frame's seq from 3 to 5 without recomputing any checksum
+	setSeqAt(t, s.Path(), offs[len(offs)-1], 5)
+
+	err := s.Replay(func(ev domain.Event) error { return nil })
+	if err == nil || err == io.EOF {
+		t.Fatal("expected replay to reject non-contiguous seq")
+	}
+	se := scerr.As(err)
+	if se == nil || se.Code != scerr.CodeLogCorrupt {
+		t.Fatalf("expected LOG_CORRUPT, got %v", err)
+	}
+	if se.LastSeq != 2 {
+		t.Fatalf("last seq = %d, want 2", se.LastSeq)
+	}
+}
+
+// TestReplayFromRejectsNonContiguousSeq verifies that incremental replay also
+// detects a non-contiguous sequence even when the tampered frame's seq is
+// greater than the afterSeq filter (the contiguity check runs before the
+// filter callback).
+func TestReplayFromRejectsNonContiguousSeq(t *testing.T) {
+	s := openStore(t, infra.RealSyncer{})
+	if _, err := s.Append(sampleEvents()); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	offs := frameOffsets(t, s.Path())
+	setSeqAt(t, s.Path(), offs[len(offs)-1], 5) // frame 3 seq jumps to 5
+
+	err := s.ReplayFrom(1, func(ev domain.Event) error { return nil })
+	if err == nil || err == io.EOF {
+		t.Fatal("expected replay-from to reject non-contiguous seq")
+	}
+	se := scerr.As(err)
+	if se == nil || se.Code != scerr.CodeLogCorrupt {
+		t.Fatalf("expected LOG_CORRUPT, got %v", err)
+	}
+	if se.LastSeq != 2 {
+		t.Fatalf("last seq = %d, want 2", se.LastSeq)
+	}
+}
+
+// TestContiguousSeqAccepted verifies that a normally-written log — whose
+// sequences are consecutive — opens, replays and reopens without error, and
+// that an append after reopen continues the sequence (no false rejection).
+func TestContiguousSeqAccepted(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/events.log"
+	s, err := Open(path, infra.RealSyncer{})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := s.Append(sampleEvents()); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if got := s.LastSeq(); got != 3 {
+		t.Fatalf("last seq = %d, want 3", got)
+	}
+	var n int
+	if err := s.Replay(func(ev domain.Event) error { n++; return nil }); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("replayed %d events, want 3", n)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// reopen continues the sequence
+	s2, err := Open(path, infra.RealSyncer{})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	if got := s2.LastSeq(); got != 3 {
+		t.Fatalf("reopened last seq = %d, want 3", got)
+	}
+	evs, err := s2.Append(sampleEvents()[:1])
+	if err != nil {
+		t.Fatalf("append after reopen: %v", err)
+	}
+	if evs[0].Seq != 4 {
+		t.Fatalf("seq after reopen = %d, want 4", evs[0].Seq)
 	}
 }
 

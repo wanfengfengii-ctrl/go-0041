@@ -4,7 +4,8 @@
 // The log is a sequence of binary frames. Each frame is:
 //
 //	[ 4] magic "SCG1"
-//	[ 8] sequence number (uint64 big-endian) — monotonic across the log
+//	[ 8] sequence number (uint64 big-endian) — consecutive across the log
+//	     (each frame's seq is exactly one greater than its predecessor's)
 //	[ 4] body length   (uint32 big-endian)
 //	[ 4] previous-frame digest (CRC32) — chains frames; 0 for the first frame
 //	[ 4] body CRC32     (CRC32-IEEE of the body bytes)
@@ -56,10 +57,14 @@ func encodeFrame(seq uint64, prevDigest uint32, body []byte) []byte {
 	return buf
 }
 
-// decodeFrame reads one frame from f, returning the event, the offset of the
-// frame start, the frame's own digest (for chaining the next frame) and a
-// structured error if the frame is truncated or corrupt.
-func decodeFrame(f *os.File, base int64, prevDigest uint32) (domain.Event, uint32, error) {
+// decodeFrame reads one frame from f, returning the event, the frame's own
+// digest (for chaining the next frame) and a structured error if the frame is
+// truncated or corrupt. prevDigest chains the frame to its predecessor;
+// expectedSeq is the sequence number the frame must carry (previous + 1), so a
+// duplicate, backward or jumped sequence is reported as corruption rather than
+// silently accepted — the digest chain cannot detect this on the last frame,
+// whose own digest is never verified by a successor.
+func decodeFrame(f *os.File, base int64, prevDigest uint32, expectedSeq uint64) (domain.Event, uint32, error) {
 	header := make([]byte, FrameHeaderSize)
 	n, err := io.ReadFull(f, header)
 	if err == io.EOF || (err == io.ErrUnexpectedEOF && n == 0) {
@@ -111,6 +116,15 @@ func decodeFrame(f *os.File, base int64, prevDigest uint32) (domain.Event, uint3
 		return domain.Event{}, 0, scerr.New(scerr.CodeLogCorrupt,
 			fmt.Sprintf("invalid event JSON at offset %d: %v", base, err)).
 			WithLogOffset(base, int(bodyLen), seq)
+	}
+	// Sequence contiguity: each frame's seq must be exactly one greater than the
+	// previous frame's. A duplicate, backward or jumped seq means the header was
+	// tampered with; treat it as corruption so the last valid sequence is
+	// retained and no further frames are accepted.
+	if seq != expectedSeq {
+		return domain.Event{}, 0, scerr.New(scerr.CodeLogCorrupt,
+			fmt.Sprintf("non-contiguous sequence at offset %d: expected %d got %d", base, expectedSeq, seq)).
+			WithLogOffset(base, int(bodyLen), expectedSeq-1)
 	}
 	ev.Seq = seq
 	digest := frameDigest(header, body)

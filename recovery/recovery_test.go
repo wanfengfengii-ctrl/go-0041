@@ -190,3 +190,30 @@ func TestReopenAfterRestart(t *testing.T) {
 		t.Fatalf("reopened digest %s != published %s", res.Digest, pubDigest)
 	}
 }
+
+// TestRecoveryRejectsNonContiguousLog verifies that recovery treats a
+// non-contiguous sequence number (here a jumped last-frame seq, with no
+// recomputed checksum) as log corruption: it surfaces LOG_CORRUPT carrying the
+// last valid sequence and publishes no state.
+func TestRecoveryRejectsNonContiguousLog(t *testing.T) {
+	s := buildPopulatedSystem(t)
+	// buildPopulatedSystem appends 7 events (seqs 1..7); jump the last seq to 99.
+	path := s.Dir + "/events.log"
+	off := lastFrameOffset(t, path)
+	setSeqAt(t, path, off, 99)
+
+	res, err := recovery.FromLog(s.Store)
+	if err == nil {
+		t.Fatal("expected recovery to reject non-contiguous seq")
+	}
+	if res != nil {
+		t.Fatalf("expected nil result (no published state), got %+v", res)
+	}
+	se := scerr.As(err)
+	if se == nil || se.Code != scerr.CodeLogCorrupt {
+		t.Fatalf("expected LOG_CORRUPT, got %v", err)
+	}
+	if se.LastSeq != 6 {
+		t.Fatalf("last seq = %d, want 6 (last valid)", se.LastSeq)
+	}
+}
