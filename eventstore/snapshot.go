@@ -141,6 +141,17 @@ func (s *SnapshotStore) Read() (*SnapshotFile, error) {
 		return nil, scerr.New(scerr.CodeLogCorrupt, fmt.Sprintf("snapshot is not valid JSON: %v", err)).
 			WithLogOffset(0, len(data), 0)
 	}
+	// A null family entry (e.g. "families": [null, {...}]) decodes to a nil
+	// pointer in the slice. Such an entry would panic the digest recomputation
+	// and seal-count walk below; reject it up front as a structured corruption
+	// error so callers fall back to the event log instead of crashing.
+	for i, fam := range snap.Families {
+		if fam == nil {
+			return nil, scerr.New(scerr.CodeLogCorrupt,
+				fmt.Sprintf("snapshot family at index %d is null", i)).
+				WithLogOffset(0, len(data), snap.LastSeq)
+		}
+	}
 	// verify digest
 	got, err := digestFamilies(snap.Families)
 	if err != nil {
@@ -181,6 +192,17 @@ func digestFamilies(families []*domain.Family) (string, error) {
 	type familyDigest struct {
 		FamilyID string `json:"family_id"`
 		Digest   string `json:"digest"`
+	}
+	// Reject nil entries defensively: a null in the families slice would
+	// panic the sort comparator and Digest call below. The snapshot reader
+	// guards this up front, but digestFamilies is also exported (DigestFamilies)
+	// and called from recovery, so it must not panic on hostile input.
+	for i, f := range families {
+		if f == nil {
+			return "", scerr.New(scerr.CodeLogCorrupt,
+				fmt.Sprintf("family at index %d is null", i)).
+				WithRetryable(false)
+		}
 	}
 	sorted := append([]*domain.Family(nil), families...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].FamilyID < sorted[j].FamilyID })

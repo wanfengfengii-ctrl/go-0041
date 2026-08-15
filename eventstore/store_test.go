@@ -1,8 +1,10 @@
 package eventstore
 
 import (
+	"bytes"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -274,6 +276,102 @@ func TestSnapshotRejectsTamperedDigest(t *testing.T) {
 	_, err := snaps.Read()
 	if err == nil {
 		t.Fatal("expected error reading tampered snapshot")
+	}
+	se := scerr.As(err)
+	if se == nil || se.Code != scerr.CodeLogCorrupt {
+		t.Fatalf("expected LOG_CORRUPT, got %v", err)
+	}
+}
+
+// injectNullFamily rewrites a snapshot file so the families array begins with a
+// null entry, e.g. "families":[{...}] -> "families":[null,{...}]. This models a
+// corrupted/tampered snapshot where a family slot failed to serialise.
+func injectNullFamily(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	marker := []byte(`"families":[`)
+	idx := bytes.Index(data, marker)
+	if idx < 0 {
+		t.Fatalf("families marker not found in snapshot")
+	}
+	out := append([]byte(nil), data[:idx+len(marker)]...)
+	out = append(out, []byte("null,")...)
+	out = append(out, data[idx+len(marker):]...)
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatalf("write corrupted snapshot: %v", err)
+	}
+}
+
+// TestSnapshotRejectsNullFamily verifies that a snapshot whose families array
+// contains a null entry is rejected with a structured LOG_CORRUPT error rather
+// than panicking the process. Previously the nil pointer panicked digest
+// recomputation (the sort comparator / Family.Digest) and the seal-count walk.
+func TestSnapshotRejectsNullFamily(t *testing.T) {
+	dir := t.TempDir()
+	snaps := NewSnapshotStore(dir+"/snapshot.json", infra.RealSyncer{})
+	f := domain.NewFamily("fam-1")
+	_, _ = f.Apply(domain.Command{Op: domain.OpRegister, Principal: domain.Principal{Department: "lab", Role: domain.RoleOperator}, FamilyID: "fam-1", EntityID: "m1", Source: "s", Volume: 1000, Now: time.Unix(1, 0)})
+	if err := snaps.Write(map[string]*domain.Family{"fam-1": f}, 3); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	injectNullFamily(t, snaps.Path())
+
+	// Read must return a structured error, not panic. Guard with recover so a
+	// regression fails the test cleanly instead of crashing the binary.
+	var (
+		got *SnapshotFile
+		err error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Read panicked on null family entry: %v", r)
+			}
+		}()
+		got, err = snaps.Read()
+	}()
+	if got != nil {
+		t.Fatalf("expected no snapshot, got %+v", got)
+	}
+	if err == nil {
+		t.Fatal("expected error reading snapshot with null family")
+	}
+	se := scerr.As(err)
+	if se == nil || se.Code != scerr.CodeLogCorrupt {
+		t.Fatalf("expected LOG_CORRUPT, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "null") {
+		t.Fatalf("expected error to mention null entry, got %q", err.Error())
+	}
+}
+
+// TestDigestFamiliesRejectsNull verifies the digest (summary validation)
+// boundary directly: a null family in the input yields a structured
+// LOG_CORRUPT error instead of a nil-pointer panic in the sort or Digest call.
+func TestDigestFamiliesRejectsNull(t *testing.T) {
+	f := domain.NewFamily("fam-1")
+	_, _ = f.Apply(domain.Command{Op: domain.OpRegister, Principal: domain.Principal{Department: "lab", Role: domain.RoleOperator}, FamilyID: "fam-1", EntityID: "m1", Source: "s", Volume: 1000, Now: time.Unix(1, 0)})
+
+	var (
+		d   string
+		err error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("DigestFamilies panicked on null family: %v", r)
+			}
+		}()
+		d, err = DigestFamilies([]*domain.Family{f, nil})
+	}()
+	if d != "" {
+		t.Fatalf("expected empty digest, got %q", d)
+	}
+	if err == nil {
+		t.Fatal("expected error digesting families with null entry")
 	}
 	se := scerr.As(err)
 	if se == nil || se.Code != scerr.CodeLogCorrupt {

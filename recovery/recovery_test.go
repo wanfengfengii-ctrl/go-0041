@@ -190,3 +190,134 @@ func TestReopenAfterRestart(t *testing.T) {
 		t.Fatalf("reopened digest %s != published %s", res.Digest, pubDigest)
 	}
 }
+
+// TestCorruptSnapshotNullFamilyFallsBackToLog verifies that a snapshot whose
+// families array contains a null entry — which previously caused a nil-pointer
+// panic at the digest/summary-validation boundary — is now rejected with a
+// structured error and FromSnapshot safely falls back to a full log replay,
+// surfacing the skip via SnapshotSkipped, without crashing the process.
+func TestCorruptSnapshotNullFamilyFallsBackToLog(t *testing.T) {
+	s := buildPopulatedSystem(t)
+	if err := s.Coord.Snapshot(s.Snaps); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	pubDigest, _ := s.Coord.DigestAll()
+
+	// corrupt the snapshot by injecting a null family entry
+	if err := injectNullFamily(s.Snaps.Path()); err != nil {
+		t.Fatalf("inject null family: %v", err)
+	}
+
+	// Read must return a structured LOG_CORRUPT error rather than panicking.
+	_, err := s.Snaps.Read()
+	if err == nil {
+		t.Fatal("expected snapshot read to fail on null family entry")
+	}
+	se := scerr.As(err)
+	if se == nil || se.Code != scerr.CodeLogCorrupt {
+		t.Fatalf("expected LOG_CORRUPT, got %v", err)
+	}
+
+	// FromSnapshot must not panic and must fall back to the full log.
+	var res *recovery.Result
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("FromSnapshot panicked on null family entry: %v", r)
+			}
+		}()
+		res, err = recovery.FromSnapshot(s.Store, s.Snaps)
+	}()
+	if err != nil {
+		t.Fatalf("from snapshot with null-family snapshot: %v", err)
+	}
+	if !res.SnapshotSkipped {
+		t.Fatal("expected SnapshotSkipped to be true for null-family snapshot")
+	}
+	if res.Digest != pubDigest {
+		t.Fatalf("recovered digest %s != published %s", res.Digest, pubDigest)
+	}
+}
+
+// TestRestartRecoversFromCorruptSnapshot verifies the service-restart recovery
+// path: after a restart, a snapshot corrupted with a null family entry must not
+// crash startup; recovery falls back to replaying the event log from disk and
+// reconstructs the published state exactly.
+func TestRestartRecoversFromCorruptSnapshot(t *testing.T) {
+	s := buildPopulatedSystem(t)
+	if err := s.Coord.Snapshot(s.Snaps); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	pubDigest, _ := s.Coord.DigestAll()
+
+	// simulate the on-disk snapshot being corrupted (null family slot)
+	if err := injectNullFamily(s.Snaps.Path()); err != nil {
+		t.Fatalf("inject null family: %v", err)
+	}
+
+	// simulate a process restart: close and reopen the store + snapshot store
+	_ = s.Store.Close()
+	reopenedStore, err := eventstore.Open(s.Dir+"/events.log", infra.RealSyncer{})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopenedStore.Close()
+	reopenedSnaps := eventstore.NewSnapshotStore(s.Snaps.Path(), infra.RealSyncer{})
+
+	// recovery must succeed via log fallback, never panic
+	var res *recovery.Result
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("recovery panicked on restart with null-family snapshot: %v", r)
+			}
+		}()
+		res, err = recovery.FromSnapshot(reopenedStore, reopenedSnaps)
+	}()
+	if err != nil {
+		t.Fatalf("recover on restart: %v", err)
+	}
+	if !res.SnapshotSkipped {
+		t.Fatal("expected SnapshotSkipped to be true on restart")
+	}
+	if res.FromSnapshot {
+		t.Fatal("expected recovery to come from the full log, not the snapshot")
+	}
+	if res.Digest != pubDigest {
+		t.Fatalf("recovered digest %s != published %s", res.Digest, pubDigest)
+	}
+}
+
+// TestRestartFromValidSnapshot verifies the normal service-restart recovery
+// path: after a restart with a valid snapshot, recovery uses the snapshot and
+// reproduces the published state exactly.
+func TestRestartFromValidSnapshot(t *testing.T) {
+	s := buildPopulatedSystem(t)
+	if err := s.Coord.Snapshot(s.Snaps); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	pubDigest, _ := s.Coord.DigestAll()
+
+	// simulate a process restart: close and reopen the store + snapshot store
+	_ = s.Store.Close()
+	reopenedStore, err := eventstore.Open(s.Dir+"/events.log", infra.RealSyncer{})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopenedStore.Close()
+	reopenedSnaps := eventstore.NewSnapshotStore(s.Snaps.Path(), infra.RealSyncer{})
+
+	res, err := recovery.FromSnapshot(reopenedStore, reopenedSnaps)
+	if err != nil {
+		t.Fatalf("recover on restart: %v", err)
+	}
+	if res.SnapshotSkipped {
+		t.Fatal("expected snapshot to be used, not skipped, for a valid snapshot")
+	}
+	if !res.FromSnapshot {
+		t.Fatal("expected recovery to come from the snapshot")
+	}
+	if res.Digest != pubDigest {
+		t.Fatalf("recovered digest %s != published %s", res.Digest, pubDigest)
+	}
+}

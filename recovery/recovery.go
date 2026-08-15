@@ -100,6 +100,18 @@ func FromSnapshot(store *eventstore.Store, snaps *eventstore.SnapshotStore) (*Re
 	}
 	fams := map[string]*domain.Family{}
 	for _, f := range snap.Families {
+		if f == nil {
+			// A null family entry is corruption. SnapshotStore.Read rejects
+			// this, but defend the FromSnapshot boundary directly so a nil
+			// entry can never panic this loop; fall back to the full log.
+			res, lerr := FromLog(store)
+			if lerr != nil {
+				return nil, lerr
+			}
+			res.SnapshotSkipped = true
+			res.SnapshotReason = "snapshot contains a null family entry"
+			return res, nil
+		}
 		fams[f.FamilyID] = f
 	}
 	var lastSeq uint64 = snap.LastSeq
