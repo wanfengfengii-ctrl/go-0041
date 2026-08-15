@@ -143,6 +143,54 @@ func TestBatchImportEndpoint(t *testing.T) {
 	}
 }
 
+func TestBatchExpectedRevisionPrecondition(t *testing.T) {
+	s := testutil.NewSystem(t)
+	keys := infra.NewMapKeyStore(map[string][]byte{"k1": []byte("secret")})
+	adapter := lims.NewAdapter(s.Coord, keys)
+	server := httpapi.New(s.Coord, s.Store, adapter, s.IDGen)
+	testutil.Register(s, t, "fam-stale", "m1", "donor", "lab", 100)
+	testutil.Aliquot(s, t, "fam-stale", "m1", "existing", "lab", 10)
+	records := []lims.Record{
+		{Op: domain.OpAliquot, FamilyID: "fam-stale", ParentID: "m1", ChildID: "stale-1", Volume: 10, ExpectedRevision: 1, Operator: "o", Department: "lab", Role: "operator"},
+		{Op: domain.OpAliquot, FamilyID: "fam-stale", ParentID: "m1", ChildID: "stale-2", Volume: 10, ExpectedRevision: 1, Operator: "o", Department: "lab", Role: "operator"},
+	}
+	sig, err := lims.Sign([]byte("secret"), records)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	body, err := lims.EncodeJSON(records, "k1", sig)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	before := s.Coord.Family("fam-stale")
+	seqBefore := s.Coord.AppliedSeq()
+	committedBefore := s.Store.CommittedAt()
+	req := httptest.NewRequest(http.MethodPost, "/batches", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, req)
+	resp := recorder.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnprocessableEntity)
+	}
+	var se scerr.Error
+	if err := json.NewDecoder(resp.Body).Decode(&se); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if se.Code != scerr.CodeBatchPartialInvalid || len(se.Details) != 2 || se.Details[0].Code != scerr.CodeRevisionConflict || se.Details[1].Code != scerr.CodeRevisionConflict {
+		t.Fatalf("unexpected structured error: %+v", se)
+	}
+	after := s.Coord.Family("fam-stale")
+	if after.Revision != before.Revision || after.Mother.Available != before.Mother.Available || len(after.Tubes) != len(before.Tubes) {
+		t.Fatalf("rejected HTTP batch changed family: before=%+v after=%+v", before, after)
+	}
+	if s.Coord.AppliedSeq() != seqBefore || s.Store.CommittedAt() != committedBefore {
+		t.Fatal("rejected HTTP batch changed log")
+	}
+}
+
 func TestPermissionDeniedStatus(t *testing.T) {
 	ts, _ := newServer(t)
 	// auditor attempts a write -> 403

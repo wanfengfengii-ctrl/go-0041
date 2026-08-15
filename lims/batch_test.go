@@ -191,6 +191,52 @@ func TestBatchPartialInvalid(t *testing.T) {
 	}
 }
 
+func TestBatchExpectedRevisionPrecondition(t *testing.T) {
+	for _, format := range []string{"json", "csv"} {
+		t.Run(format, func(t *testing.T) {
+			a, s := newAdapter(t)
+			testutil.Register(s, t, "fam-stale", "m1", "donor", "lab", 100)
+			testutil.Aliquot(s, t, "fam-stale", "m1", "existing", "lab", 10)
+			records := []lims.Record{
+				{Op: domain.OpAliquot, FamilyID: "fam-stale", ParentID: "m1", ChildID: "stale-1", Volume: 10, ExpectedRevision: 1, Operator: "o", Department: "lab", Role: "operator"},
+				{Op: domain.OpAliquot, FamilyID: "fam-stale", ParentID: "m1", ChildID: "stale-2", Volume: 10, ExpectedRevision: 1, Operator: "o", Department: "lab", Role: "operator"},
+			}
+			sig, err := lims.Sign(secret, records)
+			if err != nil {
+				t.Fatalf("sign: %v", err)
+			}
+			var body []byte
+			if format == "json" {
+				body, err = lims.EncodeJSON(records, keyID, sig)
+			} else {
+				body, err = lims.EncodeCSV(records, keyID, sig)
+			}
+			if err != nil {
+				t.Fatalf("encode %s: %v", format, err)
+			}
+
+			before := s.Coord.Family("fam-stale")
+			seqBefore := s.Coord.AppliedSeq()
+			committedBefore := s.Store.CommittedAt()
+			_, err = a.Import(format, body)
+			if !scerr.Is(err, scerr.CodeBatchPartialInvalid) {
+				t.Fatalf("expected BATCH_PARTIAL_INVALID, got %v", err)
+			}
+			se := scerr.As(err)
+			if len(se.Details) != 2 || se.Details[0].Code != scerr.CodeRevisionConflict || se.Details[1].Code != scerr.CodeRevisionConflict {
+				t.Fatalf("expected two REVISION_CONFLICT details, got %+v", se.Details)
+			}
+			after := s.Coord.Family("fam-stale")
+			if after.Revision != before.Revision || after.Mother.Available != before.Mother.Available || len(after.Tubes) != len(before.Tubes) {
+				t.Fatalf("rejected %s batch changed family: before=%+v after=%+v", format, before, after)
+			}
+			if s.Coord.AppliedSeq() != seqBefore || s.Store.CommittedAt() != committedBefore {
+				t.Fatalf("rejected %s batch changed log", format)
+			}
+		})
+	}
+}
+
 // TestBatchRetryAfterFix verifies that after fixing the invalid records the
 // batch imports and produces exactly one set of events.
 func TestBatchRetryAfterFix(t *testing.T) {

@@ -112,12 +112,11 @@ func (c *Coordinator) Submit(cmd domain.Command) (domain.Event, error) {
 }
 
 // SubmitBatch applies a sequence of commands atomically: all succeed and are
-// persisted, or none are. It is used by the LIMS batch adapter. Within a batch
-// the expected-revision check is relaxed (each command uses the working
-// revision) because the batch holds the family locks for its duration.
-// Authorisation is performed per-record inside execute so that a batch with
-// multiple invalid records reports all of them rather than stopping at the
-// first.
+// persisted, or none are. It is used by the LIMS batch adapter. Each explicit
+// expected revision is checked against the state visible at that point in the
+// batch; a zero revision leaves the precondition unspecified. Authorisation is
+// performed per-record inside execute so that a batch with multiple invalid
+// records reports all of them rather than stopping at the first.
 func (c *Coordinator) SubmitBatch(cmds []domain.Command) ([]domain.Event, error) {
 	now := c.clock.Now()
 	for i := range cmds {
@@ -173,15 +172,19 @@ func (c *Coordinator) execute(cmds []domain.Command) ([]domain.Event, error) {
 	var problems []scerr.Detail
 	for i, cmd := range cmds {
 		fam := working[cmd.FamilyID]
-		// batch mode: relax revision (use working). single command: enforce.
-		if len(cmds) == 1 {
-			if cmd.ExpectedRevision != 0 && fam.Revision != cmd.ExpectedRevision {
+		if cmd.ExpectedRevision != 0 && fam.Revision != cmd.ExpectedRevision {
+			if len(cmds) == 1 {
 				return nil, scerr.New(scerr.CodeRevisionConflict,
 					"expected revision does not match current").
 					WithOperation(cmd.Op).WithEntity(cmd.EntityID)
 			}
-		} else {
-			cmd.ExpectedRevision = fam.Revision
+			problems = append(problems, scerr.Detail{
+				RecordIndex: i,
+				Code:        scerr.CodeRevisionConflict,
+				Message:     "expected revision does not match batch-visible revision",
+				Field:       "expected_revision",
+			})
+			continue
 		}
 		// authorise per-record; in batch mode failures become per-record details
 		if err := domain.Authorize(cmd); err != nil {

@@ -173,6 +173,72 @@ func TestRevisionConflictOnStaleCommand(t *testing.T) {
 	}
 }
 
+func TestBatchExpectedRevisionPrecondition(t *testing.T) {
+	t.Run("stale revisions reject the whole batch", func(t *testing.T) {
+		s := testutil.NewSystem(t)
+		registerFamily(s, t, "fam-1", "m1", "lab", 100)
+		testutil.Aliquot(s, t, "fam-1", "m1", "existing", "lab", 10)
+
+		before := s.Coord.Family("fam-1")
+		seqBefore := s.Coord.AppliedSeq()
+		committedBefore := s.Store.CommittedAt()
+		_, err := s.Coord.SubmitBatch([]domain.Command{
+			{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1", ParentID: "m1", ChildID: "stale-1", Volume: 10, ExpectedRevision: 1},
+			{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1", ParentID: "m1", ChildID: "stale-2", Volume: 10, ExpectedRevision: 1},
+		})
+		if !scerr.Is(err, scerr.CodeBatchPartialInvalid) {
+			t.Fatalf("expected BATCH_PARTIAL_INVALID, got %v", err)
+		}
+		se := scerr.As(err)
+		if len(se.Details) != 2 {
+			t.Fatalf("revision conflict details = %d, want 2", len(se.Details))
+		}
+		for i, detail := range se.Details {
+			if detail.RecordIndex != i || detail.Code != scerr.CodeRevisionConflict {
+				t.Fatalf("detail %d = %+v, want record %d REVISION_CONFLICT", i, detail, i)
+			}
+		}
+
+		after := s.Coord.Family("fam-1")
+		if after.Revision != before.Revision || after.Mother.Available != before.Mother.Available || len(after.Tubes) != len(before.Tubes) {
+			t.Fatalf("rejected batch changed family: before=%+v after=%+v", before, after)
+		}
+		if s.Coord.AppliedSeq() != seqBefore || s.Store.CommittedAt() != committedBefore {
+			t.Fatalf("rejected batch changed log: seq=%d/%d committed=%d/%d", s.Coord.AppliedSeq(), seqBefore, s.Store.CommittedAt(), committedBefore)
+		}
+	})
+
+	t.Run("batch visible revisions remain valid", func(t *testing.T) {
+		s := testutil.NewSystem(t)
+		registerFamily(s, t, "fam-1", "m1", "lab", 100)
+		events, err := s.Coord.SubmitBatch([]domain.Command{
+			{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1", ParentID: "m1", ChildID: "t1", Volume: 20, ExpectedRevision: 1},
+			{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1", ParentID: "t1", ChildID: "t2", Volume: 5, ExpectedRevision: 2},
+		})
+		if err != nil {
+			t.Fatalf("submit revision sequence: %v", err)
+		}
+		if len(events) != 2 || events[0].Revision != 2 || events[1].Revision != 3 {
+			t.Fatalf("unexpected events: %+v", events)
+		}
+	})
+
+	t.Run("unspecified revisions keep dependent batch behavior", func(t *testing.T) {
+		s := testutil.NewSystem(t)
+		registerFamily(s, t, "fam-1", "m1", "lab", 100)
+		_, err := s.Coord.SubmitBatch([]domain.Command{
+			{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1", ParentID: "m1", ChildID: "t1", Volume: 20},
+			{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1", ParentID: "t1", ChildID: "t2", Volume: 5},
+		})
+		if err != nil {
+			t.Fatalf("submit dependent batch: %v", err)
+		}
+		if fam := s.Coord.Family("fam-1"); fam.Revision != 3 || fam.Tubes["t2"] == nil {
+			t.Fatalf("dependent batch state = %+v", fam)
+		}
+	})
+}
+
 // TestFailedOperationNoSideEffects verifies a failed operation does not change
 // revision, state, log length or snapshot.
 func TestFailedOperationNoSideEffects(t *testing.T) {
