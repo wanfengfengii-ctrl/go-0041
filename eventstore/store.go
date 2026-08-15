@@ -55,9 +55,10 @@ func (s *Store) scan() error {
 	}
 	var prevDigest uint32
 	var lastGood uint64
+	nextSeq := uint64(1)
 	off := int64(0)
 	for {
-		ev, digest, err := decodeFrame(s.f, off, prevDigest)
+		ev, digest, err := decodeFrame(s.f, off, prevDigest, nextSeq)
 		if err == io.EOF {
 			break
 		}
@@ -71,6 +72,7 @@ func (s *Store) scan() error {
 		s.lastSeq = ev.Seq
 		s.lastDigest = digest
 		prevDigest = digest
+		nextSeq++
 		off, _ = s.f.Seek(0, io.SeekCurrent)
 	}
 	s.committedAt = off
@@ -154,9 +156,10 @@ func (s *Store) Replay(fn func(domain.Event) error) error {
 	}
 	var prevDigest uint32
 	var lastGood uint64
+	nextSeq := uint64(1)
 	off := int64(0)
 	for {
-		ev, digest, err := decodeFrame(s.f, off, prevDigest)
+		ev, digest, err := decodeFrame(s.f, off, prevDigest, nextSeq)
 		if err == io.EOF {
 			return nil
 		}
@@ -171,6 +174,7 @@ func (s *Store) Replay(fn func(domain.Event) error) error {
 		}
 		lastGood = ev.Seq
 		prevDigest = digest
+		nextSeq++
 		off, _ = s.f.Seek(0, io.SeekCurrent)
 	}
 }

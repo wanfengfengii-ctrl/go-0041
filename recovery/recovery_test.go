@@ -1,6 +1,8 @@
 package recovery_test
 
 import (
+	"encoding/binary"
+	"os"
 	"testing"
 
 	"specimen-custody-graph/domain"
@@ -10,6 +12,134 @@ import (
 	"specimen-custody-graph/scerr"
 	"specimen-custody-graph/testutil"
 )
+
+func regressionFrameOffsets(t *testing.T, path string) []int64 {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	var offsets []int64
+	for off := int64(0); off < int64(len(data)); {
+		offsets = append(offsets, off)
+		if off+int64(eventstore.FrameHeaderSize) > int64(len(data)) {
+			break
+		}
+		bodyLen := int64(binary.BigEndian.Uint32(data[off+12 : off+16]))
+		off += int64(eventstore.FrameHeaderSize) + bodyLen
+	}
+	return offsets
+}
+
+func rewriteRegressionFrameSeq(t *testing.T, path string, offset int64, seq uint64) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log for rewrite: %v", err)
+	}
+	binary.BigEndian.PutUint64(data[offset+4:offset+12], seq)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("rewrite log: %v", err)
+	}
+}
+
+// TestRejectsNonMonotonicLogSequence verifies that every log reader rejects
+// duplicate, backward, skipped, and invalid initial sequence numbers without
+// delivering the damaged frame to recovery.
+func TestRejectsNonMonotonicLogSequence(t *testing.T) {
+	events := []domain.Event{
+		{Type: domain.OpRegister, FamilyID: "fam-1", Revision: 1, Timestamp: 1, EntityID: "m1", Source: "s", Volume: 1000, Kind: domain.KindMother},
+		{Type: domain.OpAliquot, FamilyID: "fam-1", Revision: 2, Timestamp: 2, ParentID: "m1", ChildID: "t1", Volume: 200, Kind: domain.KindTube},
+		{Type: domain.OpDestroy, FamilyID: "fam-1", Revision: 3, Timestamp: 3, EntityID: "t1", DestructionID: "d1", Volume: 200},
+	}
+	cases := []struct {
+		name  string
+		frame int
+		seq   uint64
+	}{
+		{name: "normal", frame: -1},
+		{name: "duplicate-middle", frame: 1, seq: 1},
+		{name: "backward-last", frame: 2, seq: 1},
+		{name: "jump-middle", frame: 1, seq: 5},
+		{name: "unexpected-first", frame: 0, seq: 2},
+		{name: "duplicate-last", frame: 2, seq: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := dir + "/events.log"
+			store, err := eventstore.Open(path, infra.RealSyncer{})
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if _, err := store.Append(events); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			offsets := regressionFrameOffsets(t, path)
+			if tc.frame >= 0 {
+				rewriteRegressionFrameSeq(t, path, offsets[tc.frame], tc.seq)
+			}
+
+			if tc.frame < 0 {
+				var replayed int
+				if err := store.Replay(func(domain.Event) error { replayed++; return nil }); err != nil {
+					t.Fatalf("replay normal log: %v", err)
+				}
+				if replayed != len(events) {
+					t.Fatalf("replayed %d events, want %d", replayed, len(events))
+				}
+				res, err := recovery.FromLog(store)
+				if err != nil || res.LastSeq != 3 {
+					t.Fatalf("recover normal log: result=%+v err=%v", res, err)
+				}
+				if err := store.Close(); err != nil {
+					t.Fatalf("close normal log: %v", err)
+				}
+				reopened, err := eventstore.Open(path, infra.RealSyncer{})
+				if err != nil {
+					t.Fatalf("reopen normal log: %v", err)
+				}
+				defer reopened.Close()
+				if reopened.LastSeq() != 3 {
+					t.Fatalf("reopened last seq = %d, want 3", reopened.LastSeq())
+				}
+				return
+			}
+
+			wantLast := uint64(tc.frame)
+			checkCorrupt := func(label string, err error, callbacks int) {
+				t.Helper()
+				se := scerr.As(err)
+				if se == nil || se.Code != scerr.CodeLogCorrupt {
+					t.Fatalf("%s: expected LOG_CORRUPT, got %v", label, err)
+				}
+				if se.LastSeq != wantLast {
+					t.Fatalf("%s: last seq = %d, want %d", label, se.LastSeq, wantLast)
+				}
+				if se.LogOffset != offsets[tc.frame] {
+					t.Fatalf("%s: log offset = %d, want %d", label, se.LogOffset, offsets[tc.frame])
+				}
+				if callbacks >= 0 && callbacks != tc.frame {
+					t.Fatalf("%s: callbacks = %d, want %d", label, callbacks, tc.frame)
+				}
+			}
+
+			var replayed int
+			err = store.Replay(func(domain.Event) error { replayed++; return nil })
+			checkCorrupt("replay", err, replayed)
+			replayed = 0
+			err = store.ReplayFrom(0, func(domain.Event) error { replayed++; return nil })
+			checkCorrupt("replay from", err, replayed)
+			_, err = recovery.FromLog(store)
+			checkCorrupt("recovery", err, -1)
+			if err := store.Close(); err != nil {
+				t.Fatalf("close corrupt log: %v", err)
+			}
+			_, err = eventstore.Open(path, infra.RealSyncer{})
+			checkCorrupt("open", err, -1)
+		})
+	}
+}
 
 // buildPopulatedSystem creates a system with a multi-event family and returns
 // it along with the expected final digest of the published state.

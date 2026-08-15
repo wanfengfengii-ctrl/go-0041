@@ -56,10 +56,10 @@ func encodeFrame(seq uint64, prevDigest uint32, body []byte) []byte {
 	return buf
 }
 
-// decodeFrame reads one frame from f, returning the event, the offset of the
-// frame start, the frame's own digest (for chaining the next frame) and a
-// structured error if the frame is truncated or corrupt.
-func decodeFrame(f *os.File, base int64, prevDigest uint32) (domain.Event, uint32, error) {
+// decodeFrame reads one frame from f, returning the event, the frame's own
+// digest (for chaining the next frame) and a structured error if the frame is
+// truncated or corrupt. expectedSeq is the only valid sequence for this frame.
+func decodeFrame(f *os.File, base int64, prevDigest uint32, expectedSeq uint64) (domain.Event, uint32, error) {
 	header := make([]byte, FrameHeaderSize)
 	n, err := io.ReadFull(f, header)
 	if err == io.EOF || (err == io.ErrUnexpectedEOF && n == 0) {
@@ -83,6 +83,11 @@ func decodeFrame(f *os.File, base int64, prevDigest uint32) (domain.Event, uint3
 	bodyLen := binary.BigEndian.Uint32(header[12:16])
 	prev := binary.BigEndian.Uint32(header[16:20])
 	crc := binary.BigEndian.Uint32(header[20:24])
+	if seq != expectedSeq {
+		return domain.Event{}, 0, scerr.New(scerr.CodeLogCorrupt,
+			fmt.Sprintf("non-contiguous frame sequence at offset %d: got %d, want %d", base, seq, expectedSeq)).
+			WithLogOffset(base, int(bodyLen), expectedSeq-1)
+	}
 	if prev != prevDigest {
 		return domain.Event{}, 0, scerr.New(scerr.CodeLogCorrupt,
 			fmt.Sprintf("previous-frame digest mismatch at offset %d", base)).
