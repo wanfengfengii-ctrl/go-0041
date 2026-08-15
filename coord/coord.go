@@ -119,6 +119,16 @@ func (c *Coordinator) Submit(cmd domain.Command) (domain.Event, error) {
 // multiple invalid records reports all of them rather than stopping at the
 // first.
 func (c *Coordinator) SubmitBatch(cmds []domain.Command) ([]domain.Event, error) {
+	// An empty command batch carries no work: it would index cmds[0] for the
+	// barrier during execution and, even past that, append no events yet try to
+	// read the last persisted sequence. Reject it up front with a structured,
+	// non-retryable error before touching the lock barrier, store or published
+	// state, so JSON, CSV and direct callers all behave identically: no events
+	// appended, no sequence advance and no published family change.
+	if len(cmds) == 0 {
+		return nil, scerr.New(scerr.CodeBatchPartialInvalid,
+			"batch contains no commands").WithRetryable(false)
+	}
 	now := c.clock.Now()
 	for i := range cmds {
 		cmds[i].Now = now

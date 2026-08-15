@@ -191,6 +191,75 @@ func TestBatchPartialInvalid(t *testing.T) {
 	}
 }
 
+// TestEmptyBatchRejectedNoSideEffects verifies that a legitimately-signed LIMS
+// batch carrying no records is rejected with a structured error across both
+// the JSON and CSV adapter entries and produces no side effects: no events are
+// appended, the applied sequence does not advance and no family is published.
+// Previously such a batch panicked inside the coordinator by indexing cmds[0].
+func TestEmptyBatchRejectedNoSideEffects(t *testing.T) {
+	empty := []lims.Record{}
+	sig, err := lims.Sign(secret, empty)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	jb, err := lims.EncodeJSON(empty, keyID, sig)
+	if err != nil {
+		t.Fatalf("encode json: %v", err)
+	}
+	cb, err := lims.EncodeCSV(empty, keyID, sig)
+	if err != nil {
+		t.Fatalf("encode csv: %v", err)
+	}
+
+	cases := []struct {
+		name        string
+		contentType string
+		data        []byte
+	}{
+		{"json", "json", jb},
+		{"csv", "csv", cb},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, s := newAdapter(t)
+			seqBefore := s.Coord.AppliedSeq()
+
+			events, err := a.Import(tc.contentType, tc.data)
+			if err == nil {
+				t.Fatal("expected error for empty batch, got nil")
+			}
+			if !scerr.Is(err, scerr.CodeBatchPartialInvalid) {
+				t.Fatalf("expected BATCH_PARTIAL_INVALID, got %v", err)
+			}
+			if len(events) != 0 {
+				t.Fatalf("empty batch returned events: %d", len(events))
+			}
+			if got := s.Coord.AppliedSeq(); got != seqBefore {
+				t.Fatalf("empty batch advanced applied seq: %d != %d", got, seqBefore)
+			}
+			if got := len(s.Coord.Families()); got != 0 {
+				t.Fatalf("empty batch published families: %d", got)
+			}
+		})
+	}
+}
+
+// TestEmptyBatchRequiresValidSignature verifies that an empty batch is still
+// subject to signature verification: an empty batch with a bad signature is
+// rejected as SIGNATURE_MISMATCH, not as an empty-batch error. This guards the
+// ordering: signature first, then the empty-records boundary.
+func TestEmptyBatchRequiresValidSignature(t *testing.T) {
+	a, _ := newAdapter(t)
+	jb, err := lims.EncodeJSON([]lims.Record{}, keyID, "deadbeef")
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	_, err = a.Import("json", jb)
+	if !scerr.Is(err, scerr.CodeSignatureMismatch) {
+		t.Fatalf("expected SIGNATURE_MISMATCH for empty batch with bad sig, got %v", err)
+	}
+}
+
 // TestBatchRetryAfterFix verifies that after fixing the invalid records the
 // batch imports and produces exactly one set of events.
 func TestBatchRetryAfterFix(t *testing.T) {

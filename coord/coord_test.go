@@ -173,6 +173,47 @@ func TestRevisionConflictOnStaleCommand(t *testing.T) {
 	}
 }
 
+// TestSubmitBatchEmpty verifies that an empty command batch — the coordinator's
+// batch boundary — is rejected with a structured error and has no side effects:
+// no events are returned, the applied sequence does not advance and no family
+// is published. Both a nil slice and an explicit empty slice must behave the
+// same and must not panic (previously execute indexed cmds[0] for the barrier).
+func TestSubmitBatchEmpty(t *testing.T) {
+	cases := []struct {
+		name string
+		cmds []domain.Command
+	}{
+		{"nil", nil},
+		{"empty", []domain.Command{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testutil.NewSystem(t)
+			seqBefore := s.Coord.AppliedSeq()
+
+			events, err := s.Coord.SubmitBatch(tc.cmds)
+			if err == nil {
+				t.Fatal("expected error for empty batch, got nil")
+			}
+			if !scerr.Is(err, scerr.CodeBatchPartialInvalid) {
+				t.Fatalf("expected BATCH_PARTIAL_INVALID, got %v", err)
+			}
+			if se := scerr.As(err); se != nil && se.Retryable {
+				t.Fatalf("empty-batch error should not be retryable")
+			}
+			if len(events) != 0 {
+				t.Fatalf("empty batch returned events: %d", len(events))
+			}
+			if got := s.Coord.AppliedSeq(); got != seqBefore {
+				t.Fatalf("empty batch advanced applied seq: %d != %d", got, seqBefore)
+			}
+			if got := len(s.Coord.Families()); got != 0 {
+				t.Fatalf("empty batch published families: %d", got)
+			}
+		})
+	}
+}
+
 // TestFailedOperationNoSideEffects verifies a failed operation does not change
 // revision, state, log length or snapshot.
 func TestFailedOperationNoSideEffects(t *testing.T) {

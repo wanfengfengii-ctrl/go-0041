@@ -143,6 +143,36 @@ func TestBatchImportEndpoint(t *testing.T) {
 	}
 }
 
+func TestEmptyBatchEndpoint(t *testing.T) {
+	ts, s := newServer(t)
+	empty := []lims.Record{}
+	sig, _ := lims.Sign([]byte("secret"), empty)
+	jb, _ := lims.EncodeJSON(empty, "k1", sig)
+
+	seqBefore := s.Coord.AppliedSeq()
+	resp, err := http.Post(ts.URL+"/batches", "application/json", bytes.NewReader(jb))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	// BATCH_PARTIAL_INVALID maps to 422 Unprocessable Entity.
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnprocessableEntity)
+	}
+	var se scerr.Error
+	_ = json.NewDecoder(resp.Body).Decode(&se)
+	if se.Code != scerr.CodeBatchPartialInvalid {
+		t.Fatalf("code = %s, want %s", se.Code, scerr.CodeBatchPartialInvalid)
+	}
+	// no side effects: sequence unchanged, no family published.
+	if got := s.Coord.AppliedSeq(); got != seqBefore {
+		t.Fatalf("empty batch advanced applied seq: %d != %d", got, seqBefore)
+	}
+	if got := len(s.Coord.Families()); got != 0 {
+		t.Fatalf("empty batch published families: %d", got)
+	}
+}
+
 func TestPermissionDeniedStatus(t *testing.T) {
 	ts, _ := newServer(t)
 	// auditor attempts a write -> 403
