@@ -10,6 +10,7 @@
 package coord
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -113,11 +114,13 @@ func (c *Coordinator) Submit(cmd domain.Command) (domain.Event, error) {
 
 // SubmitBatch applies a sequence of commands atomically: all succeed and are
 // persisted, or none are. It is used by the LIMS batch adapter. Within a batch
-// the expected-revision check is relaxed (each command uses the working
-// revision) because the batch holds the family locks for its duration.
-// Authorisation is performed per-record inside execute so that a batch with
-// multiple invalid records reports all of them rather than stopping at the
-// first.
+// a command with a zero expected_revision is validated against the working
+// revision (so dependent records see the effects of earlier ones), while a
+// command carrying an explicit non-zero expected_revision must match the
+// batch-visible working revision — a stale precondition rejects the whole
+// batch atomically with a per-record REVISION_CONFLICT detail. Authorisation
+// is performed per-record inside execute so that a batch with multiple invalid
+// records reports all of them rather than stopping at the first.
 func (c *Coordinator) SubmitBatch(cmds []domain.Command) ([]domain.Event, error) {
 	now := c.clock.Now()
 	for i := range cmds {
@@ -173,16 +176,35 @@ func (c *Coordinator) execute(cmds []domain.Command) ([]domain.Event, error) {
 	var problems []scerr.Detail
 	for i, cmd := range cmds {
 		fam := working[cmd.FamilyID]
-		// batch mode: relax revision (use working). single command: enforce.
-		if len(cmds) == 1 {
-			if cmd.ExpectedRevision != 0 && fam.Revision != cmd.ExpectedRevision {
+		// Optimistic concurrency precondition. A command may carry an explicit
+		// non-zero expected_revision asserting the batch-visible revision it was
+		// authored against; zero means "no precondition" (the common batch case,
+		// where dependent records rely on the working revision advancing within
+		// the batch). The working revision (fam.Revision) is the published
+		// revision for the first record of a family and reflects earlier records
+		// in the same batch for later ones. A stale precondition must never be
+		// silently relaxed: a single command fails fast with REVISION_CONFLICT,
+		// and in a batch the offending record becomes a per-record
+		// REVISION_CONFLICT detail so the whole batch is rejected atomically — no
+		// events are appended, and AppliedSeq, family revision and sample state
+		// do not advance.
+		if cmd.ExpectedRevision != 0 && fam.Revision != cmd.ExpectedRevision {
+			if len(cmds) == 1 {
 				return nil, scerr.New(scerr.CodeRevisionConflict,
 					"expected revision does not match current").
 					WithOperation(cmd.Op).WithEntity(cmd.EntityID)
 			}
-		} else {
-			cmd.ExpectedRevision = fam.Revision
+			problems = append(problems, scerr.Detail{
+				RecordIndex: i,
+				Code:        scerr.CodeRevisionConflict,
+				Message: fmt.Sprintf("expected revision %d does not match current %d",
+					cmd.ExpectedRevision, fam.Revision),
+				Field: "expected_revision",
+			})
+			continue
 		}
+		// No precondition, or it matched: validate against the working revision.
+		cmd.ExpectedRevision = fam.Revision
 		// authorise per-record; in batch mode failures become per-record details
 		if err := domain.Authorize(cmd); err != nil {
 			if len(cmds) == 1 {

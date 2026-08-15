@@ -265,3 +265,191 @@ func TestSyncFailureNoPrematurePublish(t *testing.T) {
 		t.Fatalf("incomplete op observable: %d aliquot events", tubeCount)
 	}
 }
+
+// TestBatchStaleRevisionRejected verifies that a multi-record batch carrying an
+// explicit, stale expected_revision is rejected atomically: the same stale
+// precondition that a single command rejects with REVISION_CONFLICT must also
+// reject the batch, with no log append, no AppliedSeq advance, no family
+// revision advance and no sample-state change. Previously the batch path
+// silently overwrote the supplied revision with the working revision and
+// applied the events anyway.
+func TestBatchStaleRevisionRejected(t *testing.T) {
+	s := testutil.NewSystem(t)
+	registerFamily(s, t, "fam-1", "m1", "lab", 300)
+	// advance the family revision: register(0->1), aliquot(1->2)
+	testutil.Aliquot(s, t, "fam-1", "m1", "t1", "lab", 40)
+	if got := s.Coord.Family("fam-1").Revision; got != 2 {
+		t.Fatalf("setup revision = %d, want 2", got)
+	}
+
+	revBefore := s.Coord.Family("fam-1").Revision
+	seqBefore := s.Coord.AppliedSeq()
+	committedBefore := s.Store.CommittedAt()
+
+	// two-record batch; the second record carries a stale expected_revision (1)
+	// while the family is already at revision 2. The batch must be rejected.
+	cmds := []domain.Command{
+		{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1",
+			ParentID: "m1", ChildID: "t2", Volume: 40, ExpectedRevision: 2},
+		{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1",
+			ParentID: "m1", ChildID: "t3", Volume: 40, ExpectedRevision: 1},
+	}
+	events, err := s.Coord.SubmitBatch(cmds)
+	if err == nil {
+		t.Fatalf("expected batch rejection, got events: %d", len(events))
+	}
+	// stable, recognizable structured rejection: BATCH_PARTIAL_INVALID with a
+	// per-record REVISION_CONFLICT detail.
+	if !scerr.Is(err, scerr.CodeBatchPartialInvalid) {
+		t.Fatalf("expected BATCH_PARTIAL_INVALID, got %v", err)
+	}
+	se := scerr.As(err)
+	var conflict *scerr.Detail
+	for i := range se.Details {
+		if se.Details[i].Code == scerr.CodeRevisionConflict {
+			conflict = &se.Details[i]
+			break
+		}
+	}
+	if conflict == nil {
+		t.Fatalf("expected a REVISION_CONFLICT detail, got %+v", se.Details)
+	}
+	if conflict.RecordIndex != 1 {
+		t.Fatalf("conflict detail record index = %d, want 1", conflict.RecordIndex)
+	}
+	if conflict.Field != "expected_revision" {
+		t.Fatalf("conflict detail field = %q, want expected_revision", conflict.Field)
+	}
+
+	// whole batch rejected: nothing appended, nothing advanced.
+	if got := s.Coord.AppliedSeq(); got != seqBefore {
+		t.Fatalf("applied seq advanced on rejected batch: %d != %d", got, seqBefore)
+	}
+	if got := s.Store.CommittedAt(); got != committedBefore {
+		t.Fatalf("log advanced on rejected batch: %d != %d", got, committedBefore)
+	}
+	fam := s.Coord.Family("fam-1")
+	if fam.Revision != revBefore {
+		t.Fatalf("family revision advanced on rejected batch: %d != %d", fam.Revision, revBefore)
+	}
+	if len(fam.Tubes) != 1 || fam.Tubes["t2"] != nil || fam.Tubes["t3"] != nil {
+		t.Fatalf("sample state changed on rejected batch: tubes=%v", fam.Tubes)
+	}
+
+	// sanity: the equivalent single command with the same stale revision is
+	// also rejected with REVISION_CONFLICT (the behaviour the batch must match).
+	_, errSingle := s.Coord.Submit(domain.Command{
+		Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1",
+		ParentID: "m1", ChildID: "t4", Volume: 40, ExpectedRevision: 1,
+	})
+	if !scerr.Is(errSingle, scerr.CodeRevisionConflict) {
+		t.Fatalf("expected single command REVISION_CONFLICT, got %v", errSingle)
+	}
+}
+
+// TestBatchStaleRevisionOnFirstRecordRejected verifies that a stale
+// expected_revision on the first record of a batch — measured against the
+// published (batch-visible) state before any record applies — is also rejected
+// atomically.
+func TestBatchStaleRevisionOnFirstRecordRejected(t *testing.T) {
+	s := testutil.NewSystem(t)
+	registerFamily(s, t, "fam-1", "m1", "lab", 300)
+	testutil.Aliquot(s, t, "fam-1", "m1", "t1", "lab", 40) // rev -> 2
+
+	seqBefore := s.Coord.AppliedSeq()
+	cmds := []domain.Command{
+		// first record already stale: family at 2, asserts 1.
+		{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1",
+			ParentID: "m1", ChildID: "t2", Volume: 40, ExpectedRevision: 1},
+		{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1",
+			ParentID: "m1", ChildID: "t3", Volume: 40, ExpectedRevision: 0},
+	}
+	_, err := s.Coord.SubmitBatch(cmds)
+	if !scerr.Is(err, scerr.CodeBatchPartialInvalid) {
+		t.Fatalf("expected BATCH_PARTIAL_INVALID, got %v", err)
+	}
+	se := scerr.As(err)
+	found := false
+	for _, d := range se.Details {
+		if d.Code == scerr.CodeRevisionConflict && d.RecordIndex == 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected REVISION_CONFLICT at record 0, got %+v", se.Details)
+	}
+	if got := s.Coord.AppliedSeq(); got != seqBefore {
+		t.Fatalf("applied seq advanced on rejected batch: %d != %d", got, seqBefore)
+	}
+	fam := s.Coord.Family("fam-1")
+	if fam.Revision != 2 {
+		t.Fatalf("family revision advanced on rejected batch: %d != 2", fam.Revision)
+	}
+	if len(fam.Tubes) != 1 {
+		t.Fatalf("sample state changed on rejected batch: %d tubes", len(fam.Tubes))
+	}
+}
+
+// TestBatchExplicitRevisionMatchesDependentRecords verifies the legitimate
+// dependent-batch case: records may carry explicit expected_revision values
+// that match the batch-visible working revision as it advances within the
+// batch. Such a batch must succeed.
+func TestBatchExplicitRevisionMatchesDependentRecords(t *testing.T) {
+	s := testutil.NewSystem(t)
+	registerFamily(s, t, "fam-1", "m1", "lab", 300) // rev -> 1
+
+	// record 0 asserts the published revision (1); once it applies the working
+	// revision is 2, which record 1 then asserts.
+	cmds := []domain.Command{
+		{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1",
+			ParentID: "m1", ChildID: "t2", Volume: 40, ExpectedRevision: 1},
+		{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1",
+			ParentID: "m1", ChildID: "t3", Volume: 40, ExpectedRevision: 2},
+	}
+	events, err := s.Coord.SubmitBatch(cmds)
+	if err != nil {
+		t.Fatalf("expected batch to succeed, got %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	fam := s.Coord.Family("fam-1")
+	if fam.Revision != 3 {
+		t.Fatalf("revision = %d, want 3", fam.Revision)
+	}
+	if fam.Tubes["t2"] == nil || fam.Tubes["t3"] == nil {
+		t.Fatalf("expected tubes t2 and t3, got %+v", fam.Tubes)
+	}
+}
+
+// TestBatchUnspecifiedRevisionStillRelaxed verifies the existing behaviour for
+// records that do not specify an expected_revision (zero): the batch is
+// validated against the working revision and dependent records see the effects
+// of earlier ones. This must remain unchanged by the fix.
+func TestBatchUnspecifiedRevisionStillRelaxed(t *testing.T) {
+	s := testutil.NewSystem(t)
+	registerFamily(s, t, "fam-1", "m1", "lab", 300) // rev -> 1
+
+	// no expected_revision on either record: the batch must still succeed and
+	// the second record must see the first record's effect.
+	cmds := []domain.Command{
+		{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1",
+			ParentID: "m1", ChildID: "t2", Volume: 40},
+		{Op: domain.OpAliquot, Principal: testutil.Op("lab"), FamilyID: "fam-1",
+			ParentID: "m1", ChildID: "t3", Volume: 40},
+	}
+	events, err := s.Coord.SubmitBatch(cmds)
+	if err != nil {
+		t.Fatalf("expected batch to succeed, got %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	fam := s.Coord.Family("fam-1")
+	if fam.Revision != 3 {
+		t.Fatalf("revision = %d, want 3", fam.Revision)
+	}
+	if fam.Mother.Available != 220 {
+		t.Fatalf("mother available = %d, want 220", fam.Mother.Available)
+	}
+}

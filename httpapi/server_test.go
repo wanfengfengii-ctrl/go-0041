@@ -143,6 +143,77 @@ func TestBatchImportEndpoint(t *testing.T) {
 	}
 }
 
+// TestBatchStaleRevisionRejectedHTTP verifies the HTTP /batches boundary: a
+// batch carrying an explicit, stale expected_revision with a correct HMAC is
+// rejected with a stable, recognizable structured error (HTTP 422,
+// BATCH_PARTIAL_INVALID carrying a per-record REVISION_CONFLICT detail), and
+// the family revision and state are left unchanged.
+func TestBatchStaleRevisionRejectedHTTP(t *testing.T) {
+	ts, s := newServer(t)
+	// pre-establish a family at revision 2 (register + aliquot) via /commands.
+	post(t, ts, "/commands", map[string]any{
+		"op": "register", "family_id": "fam-st", "entity_id": "m1", "source": "s", "volume": 300,
+		"principal": map[string]any{"operator": "o", "department": "lab", "role": "operator"},
+	})
+	post(t, ts, "/commands", map[string]any{
+		"op": "aliquot", "family_id": "fam-st", "parent_id": "m1", "child_id": "t1", "volume": 40,
+		"principal": map[string]any{"operator": "o", "department": "lab", "role": "operator"},
+	})
+	if got := s.Coord.Family("fam-st").Revision; got != 2 {
+		t.Fatalf("setup revision = %d, want 2", got)
+	}
+	seqBefore := s.Coord.AppliedSeq()
+
+	// two-record batch; second record asserts stale revision 1 (family at 2).
+	records := []lims.Record{
+		{Op: domain.OpAliquot, FamilyID: "fam-st", ParentID: "m1", ChildID: "t2",
+			Volume: 40, ExpectedRevision: 2, Operator: "o", Department: "lab", Role: "operator"},
+		{Op: domain.OpAliquot, FamilyID: "fam-st", ParentID: "m1", ChildID: "t3",
+			Volume: 40, ExpectedRevision: 1, Operator: "o", Department: "lab", Role: "operator"},
+	}
+	sig, _ := lims.Sign([]byte("secret"), records)
+	jb, _ := lims.EncodeJSON(records, "k1", sig)
+	resp, err := http.Post(ts.URL+"/batches", "application/json", bytes.NewReader(jb))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	var se scerr.Error
+	if err := json.NewDecoder(resp.Body).Decode(&se); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if se.Code != scerr.CodeBatchPartialInvalid {
+		t.Fatalf("code = %s, want %s", se.Code, scerr.CodeBatchPartialInvalid)
+	}
+	hasConflict := false
+	for _, d := range se.Details {
+		if d.Code == scerr.CodeRevisionConflict {
+			hasConflict = true
+			if d.Field != "expected_revision" {
+				t.Fatalf("conflict detail field = %q, want expected_revision", d.Field)
+			}
+		}
+	}
+	if !hasConflict {
+		t.Fatalf("expected a REVISION_CONFLICT detail, got %+v", se.Details)
+	}
+
+	// no side effects: nothing appended, revision and state unchanged.
+	if got := s.Coord.AppliedSeq(); got != seqBefore {
+		t.Fatalf("applied seq advanced on rejected batch: %d != %d", got, seqBefore)
+	}
+	fam := s.Coord.Family("fam-st")
+	if fam.Revision != 2 {
+		t.Fatalf("family revision advanced on rejected batch: %d != 2", fam.Revision)
+	}
+	if len(fam.Tubes) != 1 || fam.Tubes["t2"] != nil || fam.Tubes["t3"] != nil {
+		t.Fatalf("sample state changed on rejected batch: tubes=%v", fam.Tubes)
+	}
+}
+
 func TestPermissionDeniedStatus(t *testing.T) {
 	ts, _ := newServer(t)
 	// auditor attempts a write -> 403

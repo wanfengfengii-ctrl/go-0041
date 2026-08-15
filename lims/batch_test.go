@@ -224,3 +224,152 @@ func TestBatchRetryAfterFix(t *testing.T) {
 		t.Fatalf("unexpected family state: %+v", fam)
 	}
 }
+
+// preregisterFamily sets up a family at revision 2 (register + aliquot) so a
+// subsequent batch can assert a stale expected_revision against it. It returns
+// the published revision (2).
+func preregisterFamily(t *testing.T, s *testutil.System, familyID string) uint64 {
+	t.Helper()
+	testutil.Register(s, t, familyID, "m1", "donor", "lab", 300)
+	testutil.Aliquot(s, t, familyID, "m1", "t1", "lab", 40)
+	return s.Coord.Family(familyID).Revision
+}
+
+// staleRevisionRecords builds a two-record batch whose second record carries a
+// stale expected_revision (1) against a family already at revision 2. The
+// signature is computed over the records, so the batch is correctly signed.
+func staleRevisionRecords(familyID string) []lims.Record {
+	return []lims.Record{
+		{Op: domain.OpAliquot, FamilyID: familyID, ParentID: "m1", ChildID: "t2",
+			Volume: 40, ExpectedRevision: 2, Operator: "o", Department: "lab", Role: "operator"},
+		{Op: domain.OpAliquot, FamilyID: familyID, ParentID: "m1", ChildID: "t3",
+			Volume: 40, ExpectedRevision: 1, Operator: "o", Department: "lab", Role: "operator"},
+	}
+}
+
+// dependentBatchRecords builds a legitimate dependent batch whose records carry
+// explicit expected_revision values matching the working revision as it
+// advances within the batch (1 then 2) against a family at revision 1.
+func dependentBatchRecords(familyID string) []lims.Record {
+	return []lims.Record{
+		{Op: domain.OpAliquot, FamilyID: familyID, ParentID: "m1", ChildID: "t2",
+			Volume: 40, ExpectedRevision: 1, Operator: "o", Department: "lab", Role: "operator"},
+		{Op: domain.OpAliquot, FamilyID: familyID, ParentID: "m1", ChildID: "t3",
+			Volume: 40, ExpectedRevision: 2, Operator: "o", Department: "lab", Role: "operator"},
+	}
+}
+
+// assertStaleBatchRejected checks the common invariants for a rejected stale
+// revision batch: BATCH_PARTIAL_INVALID with a per-record REVISION_CONFLICT
+// detail, and nothing written or advanced.
+func assertStaleBatchRejected(t *testing.T, s *testutil.System, familyID string, seqBefore uint64, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected batch rejection, got nil error")
+	}
+	if !scerr.Is(err, scerr.CodeBatchPartialInvalid) {
+		t.Fatalf("expected BATCH_PARTIAL_INVALID, got %v", err)
+	}
+	se := scerr.As(err)
+	var conflict *scerr.Detail
+	for i := range se.Details {
+		if se.Details[i].Code == scerr.CodeRevisionConflict {
+			conflict = &se.Details[i]
+			break
+		}
+	}
+	if conflict == nil {
+		t.Fatalf("expected a REVISION_CONFLICT detail, got %+v", se.Details)
+	}
+	if conflict.Field != "expected_revision" {
+		t.Fatalf("conflict detail field = %q, want expected_revision", conflict.Field)
+	}
+	if got := s.Coord.AppliedSeq(); got != seqBefore {
+		t.Fatalf("applied seq advanced on rejected batch: %d != %d", got, seqBefore)
+	}
+	fam := s.Coord.Family(familyID)
+	if fam.Revision != 2 {
+		t.Fatalf("family revision advanced on rejected batch: %d != 2", fam.Revision)
+	}
+	if len(fam.Tubes) != 1 || fam.Tubes["t2"] != nil || fam.Tubes["t3"] != nil {
+		t.Fatalf("sample state changed on rejected batch: tubes=%v", fam.Tubes)
+	}
+}
+
+// TestBatchStaleRevisionRejectedJSON verifies that a JSON LIMS batch carrying an
+// explicit, stale expected_revision with a correct HMAC is rejected
+// atomically, with no events appended and no state change.
+func TestBatchStaleRevisionRejectedJSON(t *testing.T) {
+	a, s := newAdapter(t)
+	preregisterFamily(t, s, "fam-st")
+	seqBefore := s.Coord.AppliedSeq()
+
+	records := staleRevisionRecords("fam-st")
+	sig, _ := lims.Sign(secret, records)
+	jb, _ := lims.EncodeJSON(records, keyID, sig)
+	_, err := a.Import("json", jb)
+	assertStaleBatchRejected(t, s, "fam-st", seqBefore, err)
+}
+
+// TestBatchStaleRevisionRejectedCSV verifies the same as the JSON case but for
+// a CSV LIMS batch, exercising the CSV parser path and the expected_revision
+// column.
+func TestBatchStaleRevisionRejectedCSV(t *testing.T) {
+	a, s := newAdapter(t)
+	preregisterFamily(t, s, "fam-st")
+	seqBefore := s.Coord.AppliedSeq()
+
+	records := staleRevisionRecords("fam-st")
+	sig, _ := lims.Sign(secret, records)
+	cb, _ := lims.EncodeCSV(records, keyID, sig)
+	_, err := a.Import("csv", cb)
+	assertStaleBatchRejected(t, s, "fam-st", seqBefore, err)
+}
+
+// TestBatchExplicitRevisionDependentJSON verifies that a legitimate dependent
+// JSON batch — whose records carry explicit expected_revision values matching
+// the batch-visible working revision — imports successfully.
+func TestBatchExplicitRevisionDependentJSON(t *testing.T) {
+	a, s := newAdapter(t)
+	testutil.Register(s, t, "fam-dep", "m1", "donor", "lab", 300) // rev -> 1
+
+	records := dependentBatchRecords("fam-dep")
+	sig, _ := lims.Sign(secret, records)
+	jb, _ := lims.EncodeJSON(records, keyID, sig)
+	events, err := a.Import("json", jb)
+	if err != nil {
+		t.Fatalf("expected dependent batch to import, got %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	fam := s.Coord.Family("fam-dep")
+	if fam.Revision != 3 {
+		t.Fatalf("revision = %d, want 3", fam.Revision)
+	}
+	if fam.Tubes["t2"] == nil || fam.Tubes["t3"] == nil {
+		t.Fatalf("expected tubes t2 and t3, got %+v", fam.Tubes)
+	}
+}
+
+// TestBatchExplicitRevisionDependentCSV verifies the legitimate dependent case
+// via the CSV path.
+func TestBatchExplicitRevisionDependentCSV(t *testing.T) {
+	a, s := newAdapter(t)
+	testutil.Register(s, t, "fam-dep", "m1", "donor", "lab", 300) // rev -> 1
+
+	records := dependentBatchRecords("fam-dep")
+	sig, _ := lims.Sign(secret, records)
+	cb, _ := lims.EncodeCSV(records, keyID, sig)
+	events, err := a.Import("csv", cb)
+	if err != nil {
+		t.Fatalf("expected dependent batch to import, got %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	fam := s.Coord.Family("fam-dep")
+	if fam.Revision != 3 {
+		t.Fatalf("revision = %d, want 3", fam.Revision)
+	}
+}
