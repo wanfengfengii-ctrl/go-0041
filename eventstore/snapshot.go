@@ -141,6 +141,13 @@ func (s *SnapshotStore) Read() (*SnapshotFile, error) {
 		return nil, scerr.New(scerr.CodeLogCorrupt, fmt.Sprintf("snapshot is not valid JSON: %v", err)).
 			WithLogOffset(0, len(data), 0)
 	}
+	for i, fam := range snap.Families {
+		if fam == nil {
+			return nil, scerr.New(scerr.CodeLogCorrupt,
+				fmt.Sprintf("snapshot family at index %d is null", i)).
+				WithLogOffset(0, len(data), snap.LastSeq)
+		}
+	}
 	// verify digest
 	got, err := digestFamilies(snap.Families)
 	if err != nil {

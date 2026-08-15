@@ -1,6 +1,8 @@
 package recovery_test
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"specimen-custody-graph/domain"
@@ -117,6 +119,48 @@ func TestCorruptSnapshotFallsBackToLog(t *testing.T) {
 	}
 	if !res.SnapshotSkipped {
 		t.Fatal("expected SnapshotSkipped to be true")
+	}
+	if res.Digest != pubDigest {
+		t.Fatalf("recovered digest %s != published %s", res.Digest, pubDigest)
+	}
+}
+
+func TestFromSnapshotFallsBackWhenFamilyIsNull(t *testing.T) {
+	s := buildPopulatedSystem(t)
+	pubDigest, err := s.Coord.DigestAll()
+	if err != nil {
+		t.Fatalf("digest published state: %v", err)
+	}
+	if err := os.WriteFile(s.Snaps.Path(), []byte(`{"last_seq":0,"digest":"","families":[null],"seal_count":0}`), 0o644); err != nil {
+		t.Fatalf("write corrupt snapshot: %v", err)
+	}
+
+	_, err = s.Snaps.Read()
+	if !scerr.Is(err, scerr.CodeLogCorrupt) {
+		t.Fatalf("snapshot read error = %v, want LOG_CORRUPT", err)
+	}
+
+	if err := s.Store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	reopened, err := eventstore.Open(s.Store.Path(), infra.RealSyncer{})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := recovery.FromSnapshot(reopened, s.Snaps)
+	if err != nil {
+		t.Fatalf("recover after restart: %v", err)
+	}
+	if !res.SnapshotSkipped {
+		t.Fatal("expected corrupt snapshot to be skipped")
+	}
+	if !strings.Contains(res.SnapshotReason, string(scerr.CodeLogCorrupt)) {
+		t.Fatalf("snapshot skip reason = %q, want LOG_CORRUPT", res.SnapshotReason)
+	}
+	if res.FromSnapshot {
+		t.Fatal("corrupt snapshot must not be used")
 	}
 	if res.Digest != pubDigest {
 		t.Fatalf("recovered digest %s != published %s", res.Digest, pubDigest)
